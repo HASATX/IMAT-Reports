@@ -1,0 +1,387 @@
+# ALERTS report - December 21, 2016, Phil Beckett
+# Added patient phone number to output - June 22, 2017, Andrea Espinosa
+# Changed from number of days looking back to interactive date range - June 26, 2017, Andrea Espinosa
+# V7.1.03
+
+# ---- SET up PANDAS options ----
+import datetime as dt
+import pandas as pd
+import numpy as np
+import string
+import random
+import atexit
+setSSQueryDefaults(sharedBufferSize=50000000*4)
+setSSQueryDefaults(timeoutsec=300)
+pd.set_option('display.width', 1000)
+starttime = dt.datetime.now()
+dNow = dt.date.today()
+dEncounter = dt.date.today()-dt.timedelta(days=365)
+dStart = dt.date.today()-dt.timedelta(days=1)
+pd.set_option('display.max_colwidth', -1)
+
+# ---- CSS STYLESHEET ----
+style = '''<style>.admissions th {background-color: #F62817} td {word-wrap: break-word; font-size: x-small} button {background-color: #F62817} td {word-wrap: break-word}</style>'''
+
+
+#--- DOCUMENTATION ----
+
+def documentation():
+    documentation = '''<body><div style="max-width:1000px; padding-left:50px; padding-right:50px;margin:auto; margin-top:50px;">
+                        <h1 style="text-align:center;">HASA Alerts</h1>
+                        <p><h3>Benefit:</h3>This report identifies patients from an upload file who have had recent clinical encounters.</p>
+                        <p><h3>Parameters:</h3>This report contains 4 parameters that allow you to easily customize this report<ul>
+                            <li>Encounter Class: Select the type of visit.</li>
+                            <li>Financial Class: Use to limit results to a specific payor class.</li>
+                            <li>DRGS: Limit results to patients with a specific diagnosis related grouper.</li>
+                            <li>Admission Window: The number of days prior to today when the encounters occured</li></ul></p>
+                        <p><h3>Output Options:</h3>This report contains 2 output options<ul>
+                            <li>Download by TIN: To split the downloadable output files into one CSV per TIN in your upload file.</li>
+                            <li>Mask PHI: Use to mask patient name and date of birth in the display and output file.</li></p>
+                        </div></body>'''
+    show_documentation(documentation)
+
+# ---- REFERENCE LISTS ----
+drgList = ['ALL','AMI','BRONCHITIS_ASTHMA','CHF','COPD','DIABETES','PNEUMONIA','RESPIRATORY_INFECTIONS']
+facilityList = ['BHS','MHM','MHS', 'Christus', 'NIX', 'SWGH', 'Spohn', 'UHS', 'Uvalde']
+encounterClassList = ['CLINIC','EMERGENCY','INPATIENT','OBSERVATION','OTHER','OUTPATIENT','PREADMISSION','UNKNOWN']
+financialClassList = ['BLUE CROSS/BLUE SHIELD','DEPARTMENTS OF CORRECTIONS','MANAGED CARE/UNSPECIFIED','MEDICAID','MEDICARE','MISCELLANEOUS/OTHER','NO PAYMENT','OTHER GOVERNMENT','PRIVATE HEALTH INSURANCE','UNKNOWN']
+
+#snomedList = ['SNAMI','SNCFH','SNPNE']
+
+
+def rand_string(seed):
+    if seed =="":
+        seed = "TRWEWFW"
+    return "%s%s" % ("DI_", u''.join(random.choice(str(seed)) for x in range(8)))
+
+#---- SET PARAMETERS ----
+
+
+queryString = '()d.date_of_service:[%s TO %s]' % (dStart,dNow)
+#encounterClassList = get_hits(queryString, fields = 'extract.encounter_class', store = 7, limit = -1)
+#print (queryString, encounterClassList)
+#exit(0)
+#financialClassList = get_hits(queryString, fields = 'extract.financial_class', store = 7, limit = -1)
+#encounterClassList = encounterClassList['extract.encounter_class'].unique().tolist()
+#encounterClassList.sort()
+eClassList = ["ALL"]
+eClassList.extend(encounterClassList)
+#encounterClassList.sort()
+#financialClassList = financialClassList['extract.financial_class'].str.upper().unique().tolist()
+#financialClassList.sort()
+fClassList = ["ALL"]
+fClassList.extend(financialClassList)
+
+params.add('encounterClassList', type='list', default=eClassList[0], choices=eClassList, display_name='Care Setting', description="Filter by the Care Setting")
+params.add('financialClass', type='list', default=fClassList[0], choices=fClassList, display_name='Financial Class', description="Filter by patient Financial Class (select one)")
+params.add('sdate', type='date',display_name='Start Date', default = dStart, description='Select start date')
+params.add('edate', type='date',display_name='End Date)', default = dStart, description='Select end date')
+params.add('dxcode', type='list', default=drgList[0], choices=drgList, display_name='DRGs', description="This will limit results to patients with selected condition or procedure (select one)")
+params.add('downloadbyTIN', type='bool', default=False, display_name='Download by TIN', description='Select to split results by TIN')
+params.add('scramble', type='bool', default=True, display_name='Mask PHI', description='Select to demo.')
+params.end()
+sdate = params.sdate
+edate = params.edate
+downloadbyTIN = params.downloadbyTIN
+
+
+# --- Get Pass through fields from Store 50 ---
+def pullpassthrough(df):
+    dfc = pd.DataFrame()
+    #df['extract.mpid'] = df['extract.mpid'].apply(lambda x: (str(x)[:-2]))
+    df.dropna(subset=['extract.mpid'],inplace=True)
+    df['extract.mpid'] = df['extract.mpid'].astype(int)
+    pids = list(pd.unique(df['extract.mpid'].ravel()))
+    #print(len(pids))
+    #print(pids)
+    #pids = map(str.lower, pids)
+  
+    flist = 'extract.mpid, extract.primary_care_provider_full_name, extract.primary_care_provider_tax_id, extract.patient_phone,extract.patient_local_id, extract.programfield'
+    criteria = '()s.mpid:IN("%s")' % ('","'.join([str(pid) for pid in pids]))
+    
+    y = get_hits(criteria, fields = flist, limit= -1, store = 50)
+    #print(criteria)
+    #print(len(y))
+    #print(y)
+    #exit(0)
+
+    if len(y)>0:
+        #y['extract.mpid'] = y['extract.mpid'].astype(str)
+        dfc = pd.merge(df,y,how='left',on='extract.mpid') 
+        #print(dfc)
+        #exit(0)
+    return dfc
+
+# --- Get Previous Encounters ---
+def pullencounters(df):
+    dfe = pd.DataFrame()
+    df.dropna(subset=['extract.mpid'],inplace=True)
+    df['extract.mpid'] = df['extract.mpid'].astype(int)
+    pids = list(pd.unique(df['extract.mpid'].ravel()))
+  
+    flist = 'extract.mpid, extract.patient_account_number' #extract.sending_facility, extract.date_of_service, extract.patient_account_number'
+    criteria = '()d.date_of_service:[ %s TO %s] AND s.trigger_event:IN("A01","A04") AND s.mpid:IN("%s")' % (dEncounter,dNow,'","'.join([str(pid) for pid in pids]))
+    
+    y = get_hits(criteria, fields = flist, limit= -1, store = 7)
+    y = y.drop_duplicates('extract.patient_account_number')
+#    y['count'] = y.groupby(['extract.mpid']).count()
+#    y.groupby('extract.mpid')['extract.patient_account_number'].transform("count")
+    y['EncounterCount'] = y.groupby('extract.mpid')['extract.patient_account_number'].transform(len)
+    y = y[['extract.mpid','EncounterCount']]
+    y = y.drop_duplicates('extract.mpid')
+#    print(criteria)
+#    print(len(y),"y")
+#    print(y.to_html())
+#    exit(0)
+
+    if len(y)>0:
+        #y['extract.mpid'] = y['extract.mpid'].astype(str)
+        dfe = pd.merge(df,y,how='left',on='extract.mpid') 
+#        print(dfe.to_html())
+#        exit(0)
+    return dfe
+
+    
+#---  Error Trap -----
+def traperror(text):
+    print(text)
+    Close = "True"
+    return(Close)
+    exit(0)
+    
+#--- calculate age
+def getage(dob):
+    age = dNow.year - dob.year
+    return(age)
+
+
+
+#--- get diagnosis information
+def getdx(dxin):
+    try:
+        doop = str.split(str(dxin),"DG1")
+        y=0
+        dg1rows = ""
+        for doops in doop:
+            y +=1
+            dg = str.split(str(doops),"|")
+            if len(dg) >=4:
+                y +=1
+                dg1row = [""] * 3
+                try:
+                    dg1row[0] = str(dg[2])
+                except Exception:
+                    dg1row[0] = ""
+                try:
+                    dg1row[1] = str(dg[3])
+                except Exception:
+                    dg1row[1] = ""
+                try:
+                    dg1row[2] = str(dg[15])
+                except Exception:
+                    dg1row[2] = ""
+                dg1row = "|".join(dg1row)
+                dg1rows = dg1rows + dg1row + "<br>"
+ 
+        return(dg1rows)
+    except Exception:
+        dg1rows = "none"
+        return(dg1rows)
+    
+#--- get diagnosis count
+def getdxcount(dxin):
+    y=0
+    if str(dxin) !="nan":
+        try:
+            doop = str.split(str(dxin),"DG1")
+            y=len(doop)-1
+        except Exception:
+            pass
+    return(y)
+    
+# --- Save CSV files   
+def savecsv(admits,downloadbyTIN,eclass):
+    if downloadbyTIN:
+        button = ""
+        for TIN, group in admits.groupby(['TIN']):
+            filename = 'Encounters_%s.csv' % str(TIN)
+            file = artifacts.open(filename, 'w+')
+            file.write(group.to_csv(index=False))
+            button += '<input type="button" value="Download TIN \'%s\', %s records for \'%s\'" onclick="window.location.href=\'%s\'"><br>' % (TIN, len(group), eclass, artifacts.getURL(filename))
+            file.close()
+        return button
+    else:
+        filename = 'Admissions_%s.csv' % str(eclass)
+        file = artifacts.open(filename, 'w+')
+        file.write(admits.to_csv(index=False))
+        file.close()
+        return '<input type="button" value="Download CSV for care setting \'%s\'" onclick="window.location.href=\'%s\'">' % (eclass,artifacts.getURL(filename))
+    
+
+def processdf(admits,Scramble,downloadbyTIN,eclass):
+    
+#    print(len(admits),"a")
+    if len(admits)>0: 
+        admitcount = pullpassthrough(admits) 
+#    print(len(admitcount),"b")
+    if len(admitcount)>0:
+        admitcount = pullencounters(admitcount)
+#    print(len(admitcount),"c")
+
+    if len(admitcount)>0:
+        admitcount['extract.date_of_birth'] =  admitcount['extract.date_of_birth'].apply(lambda x: (str(x)[:10]))
+        admitcount['extract.date_of_birth'] = pd.to_datetime(admitcount['extract.date_of_birth'], format='%Y-%m-%d')
+        admitcount['age2'] = admitcount['extract.date_of_birth'].map(lambda x: getage(x))
+
+        if Scramble:
+            admitcount['extract.full_name'] = admitcount['extract.full_name'].apply(lambda x: (rand_string(x)))
+            admitcount['extract.date_of_birth'] = admitcount['extract.date_of_birth'].apply(lambda x: (rand_string(x)))
+            admitcount['extract.patient_street_address'] = admitcount['extract.patient_street_address'].apply(lambda x: (rand_string(x)))
+            admitcount['extract.patient_city'] = admitcount['extract.patient_city'].apply(lambda x: (rand_string(x)))
+            admitcount['extract.patient_first_name'] = admitcount['extract.patient_first_name'].apply(lambda x: (rand_string(x)))
+            admitcount['extract.patient_last_name'] = admitcount['extract.patient_last_name'].apply(lambda x: (rand_string(x)))            
+            #admitcount['extract.patient_phone'] = admitcount['extract.patient_phone'].apply(lambda x: (rand_string(x)))
+
+
+        admitcount['extract.description_of_diagnosis'] = admitcount['extract.description_of_diagnosis'].apply(lambda x: (str(x)[:50]))    
+        admitcount['extract.admit_time'] = admitcount['extract.admit_time'].apply(lambda x: (str(x)[:10]))
+        admitcount['extract.admit_time'] = pd.to_datetime(admitcount['extract.admit_time'], format='%Y-%m-%d')
+        
+        admitcount['extract.discharge_time'] = np.where(admitcount['extract.discharge_time'] == "0000", "", admitcount['extract.discharge_time'])
+        admitcount['extract.discharge_time'] = admitcount['extract.discharge_time'].apply(lambda x: (str(x)[:10]))
+        try:
+            admitcount['extract.discharge_time'] = pd.to_datetime(admitcount['extract.discharge_time'], format='%Y-%m-%d')
+        except Exception:
+            print("formatting error in discharge date - please forward to HASA helpdesk")
+            exit(0)
+    #    admitcount['extract.mpid'] = admitcount['extract.mpid'].apply(lambda x: (str(x)[:-5]))
+    #    admitcount['extract.mpid'] = admitcount['extract.mpid'].apply(lambda mpid: '<a href="/extensions/cpc/#/patients/%s/summary" target="_blank"><button>%s</button></a>' % (mpid, mpid))
+        if len(admitcount)> 0:
+            admitcount['LOS'] = (admitcount['extract.discharge_time'] - admitcount['extract.admit_time'])
+            admitcount['diagnoses'] = admitcount['extract.diagnosis_info'].map(lambda x: getdx(x))
+            admitcount['DX_count'] = admitcount['extract.diagnosis_info'].map(lambda x: getdxcount(x))
+            
+        else:
+            admitcount['LOS'] = " "
+        admitcount = admitcount.sort_values(by=['extract.mpid','extract.admit_time'])
+        admitcount.columns =['Encounter id','Patient MPID','Admit Date','Discharge Date','Facility','Patient Name','Reason for visit','Diagnoses_old','DOB','Discharge notes','Admit Source','local MRN','Encounter Class','Financial Class','Street','City','DG Priority','HASA Patient Phone','HASAPID','FirstName','LastName','MiddleName','State','ZIPCode','MRN','Age','Gender','Race','Ethnicity','diagnosis_info','Provider name','TIN','Phone','Member ID','Program','last 12 month<br>Encounter Count','age2','LOS','Diagnoses<br>(code type|description|priority)','DX_count']
+
+        if len(admitcount)>2000:
+            traperror("your query returned "+ str(len(admitcount))+ " records and cannot be displayed. Please filter further")
+            exit(0)
+        if len(admitcount) >0:
+            admitEOutput = admitcount[['Encounter id','HASAPID','Program','Member ID','FirstName','LastName','MiddleName','Phone','Street','City','State','ZIPCode','last 12 month<br>Encounter Count','Provider name', 'TIN','Facility','MRN','DOB','age2','Gender','Race','Ethnicity','Financial Class','Admit Date','Discharge Date','Admit Source','Encounter Class','Reason for visit','DX_count']]
+            admitEOutput.columns=['HASAEID','HASAPID', 'Program','MemberID', 'FirstName','LastName','MiddleName','Patient Phone','Address','City','State','ZIPCode','PrevEncounters','PCP Name','PCP TIN','Facility','MRN','DOB','Age','Gender','Race','Ethnicity','FinancialClass','AdmitTime','DischargeTime','AdmitType','CareSetting','ReasonForVisit','DXCount']
+
+            html = savecsv(admitEOutput,downloadbyTIN,eclass)
+            print(html) 
+            print(style + admitcount.to_html(columns =[1,33,30,5,8,10,2,3,23,4,9,6,38,39,35,18,21,14,15,31,17,32], justify='left', index = False, classes='admissions', na_rep='no data', escape=False))
+
+             # --- SHOW the runtime ----
+            endtime = dt.datetime.now()
+            runtime = endtime - starttime
+            print("Note this report contains PHI - if download always encrypt file and do not violate HIPAA or BAA requirements")
+            return(admitcount)
+        else:
+            traperror("No records match criteria")
+    else:
+        traperror("No records match criteria")
+        
+    
+
+def main():
+    #raLimit = params.limit
+    #if raLimit >120:
+     #   raLimit = 120
+    dxcode = params.dxcode # concatenate to SET Name
+    fClass = params.financialClass
+    Scramble = params.scramble
+    downloadbyTIN = params.downloadbyTIN
+    queryInc = 0
+    Close = "False"
+
+    admitOutput=pd.DataFrame() #dataframe for saving all to csv
+
+
+# ---- SET time frame variables for admissions -----
+    #yesterday = str(dt.date.today()-dt.timedelta(days=1))
+    #startdate = str(dt.date.today()-dt.timedelta(days=raLimit))
+    mrndate = str(dt.date.today()-dt.timedelta(days=720))
+    print("Admission dates from", sdate, "to", edate)
+    eClasses = params.encounterClassList       
+
+# ---- QUERY for the recordset and load into dataframe ----
+  
+    for eClass in eClasses:
+        dxcode = params.dxcode
+        if 'ALL' in eClass:
+#            queryStr = '()s.encounter_class:IN("CLINIC","EMERGENCY","INPATIENT","OBSERVATION","OUTPATIENT","PREADMISSION","UNCODED","UNKNOWN") OR s.patient_class: IN("CLINIC","EMERGENCY","INPATIENT","OBSERVATION","OUTPATIENT","PREADMISSION","UNCODED","UNKNOWN") AND s.financial_class: NOT IN("NO PAYMENT") AND (d.admit_time:[%s TO %s])' %(sdate,edate)
+            queryStr = '()s.patient_class:IN("CLINIC","EMERGENCY","INPATIENT","OBSERVATION","OUTPATIENT","PREADMISSION","UNCODED","UNKNOWN") AND s.financial_class: NOT IN("NO PAYMENT") AND (d.admit_time:[%s TO %s])' %(sdate,edate)
+            #print("hi", queryStr)
+            #exit(0)
+        else:    
+#            queryStr = '()s.encounter_class:IN("%s") OR s.patient_class:IN("%s") AND (d.admit_time:[%s TO %s]) AND s.financial_class: NOT IN("NO PAYMENT")' %(eClass,eClass,sdate,edate)
+            queryStr = '()s.patient_class:IN("%s") AND (d.admit_time:[%s TO %s]) AND s.financial_class: NOT IN("NO PAYMENT")' %(eClass,sdate,edate)
+
+            #queryStr = queryStr + ' AND (d.admit_time:[%s TO %s])' %(sdate,edate)
+            #print("howdy",queryStr)
+            #exit()
+        if 'ALL' not in fClass:
+#            if fClass.count(',') >1:
+            if len(fClass) >1:
+                Close=(traperror("to filter on Financial Class select one only. You selected: " + str(len(fClass)) + " " + str(fClass)))
+            else:
+                fClass = fClass[0]
+                queryStr = queryStr + ' AND s.financial_class:IN("%s")' %(fClass)
+                print("Financial Class:", fClass)
+                queryInc += 1
+    
+        if 'ALL' not in dxcode:  # add drg set
+            if len(dxcode) >1:
+                Close=(traperror("to filter on DRG select one only. You selected: " + str(len(dxcode)) + " " + str(dxcode)))
+            else:
+                print("DRG:", dxcode[0])
+                dxcode = "__DRG" + str(dxcode[0]) + "__"
+                queryStr =  queryStr + ' AND SET:%s' % (dxcode)
+                queryInc += 1
+    
+        if queryInc == 2:
+            queryStr = queryStr + ' AND s.financial_class:IN("%s") AND SET:%s' %(fClass,dxcode)
+           
+        
+        if Close == "False":
+            admits = get_hits(queryStr, fields='extract.patient_account_number, extract.mpid, extract.admit_time, extract.discharge_time, extract.facility, extract.full_name, extract.reason_for_visit, extract.description_of_diagnosis, extract.date_of_birth, extract.discharge_notes, extract.admit_type, extract.patient_local_id, extract.patient_class, extract.patient_type, extract.financial_class, extract.patient_street_address, extract.patient_city, extract.DGPriority, extract.patient_phone,extract.mpid,extract.patient_first_name,extract.patient_last_name, extract.patient_middle_name,extract.patient_state,extract.patient_zip,extract.patient_localid,extract.patient_age,extract.patient_sex,extract.patient_race,extract.patient_ethnicity,extract.diagnosis_info', store =7, limit=-1) #
+            admits = admits.fillna(value="")
+            #print(queryStr)
+            #print(admits.to_html())
+            #exit(0)
+    ##-- Patient ID (link to CPC), Program, Member ID, Name, DOB, admit source, admit time, discharge date, LOS, Facility, discharge notes, RFV, diagnoses, PCP name, PCP Tin, Address, City, Phone
+    ##--TIn, Provider name, PID, Phone, Program
+    ##-- (17 + 5) (1,21,19,5,8,10,2,3,22,4,9,6,7,18,17,14,15,20)
+    ##--'Encounter id','Patient MPID','Admit Date','Discharge Date','Facility','Patient Name','Reason for visit','Diagnoses','DOB','Discharge notes','Admit Source','local MRN','Encounter Class','Financial Class','Street','City', 'DG Priority,'TIN','Provider name','Member ID','Phone','Program','LOS'
+    # --- PIVOT, sort and display the dataframe ----
+            admits = admits.drop_duplicates(subset='extract.patient_account_number',keep='last')
+            #print(len(admits))
+            #exit(0)
+            if len(admits)== 0:
+                traperror('No records found for these criteria')
+            else:
+                admitout = processdf(admits,Scramble,downloadbyTIN,eClass,)
+                
+                admitOutput = admitOutput.append(admitout,ignore_index=True)
+                
+                
+   # admitOutput = admitOutput.reindex(columns=['Encounter id','Patient MPID','Admit Date','Discharge Date','Facility','Patient Name','Reason for visit','Diagnoses','DOB','Discharge notes','Admit Source','local MRN','Encounter Class','Financial Class','Street','City','DG Priority','HASA Patient Phone','Provider name','Member ID','Phone','TIN','Program','LOS','HASAPID','FirstName','LastName','MiddleName','State','ZIPCode','MRN','Age','Gender','Race','Ethnicity'])
+   # V7 columns =['Encounter id','Patient MPID','Admit Date','Discharge Date','Facility','Patient Name','Reason for visit','Diagnoses','DOB','Discharge notes','Admit Source','local MRN','Encounter Class','Financial Class','Street','City','DG Priority','HASA Patient Phone','HASAPID','FirstName','LastName','MiddleName','State','ZIPCode','MRN','Age','Gender','Race','Ethnicity','Provider name','TIN','Phone','Member ID','Program','LOS']
+   # V6 columns HASAEID	HASAPID	Program	MemberID	FirstName	LastName	MiddleName	Patient Phone	Address	City	State	ZIPCode	PrevEncounters	PCP Name	PCP TIN	Facility	MRN	DOB	Age	Gender	Race	Ethnicity	FinancialClass	AdmitTime	DischargeTime	AdmitType	CareSetting	ReasonForVisit	DXCount
+    if len(admitOutput)>0:
+        admitOutput = admitOutput[['Encounter id','HASAPID','Program','Member ID','FirstName','LastName','MiddleName','Phone','Street','City','State','ZIPCode','last 12 month<br>Encounter Count','Provider name', 'TIN','Facility','MRN','DOB','age2','Gender','Race','Ethnicity','Financial Class','Admit Date','Discharge Date','Admit Source','Encounter Class','Patient Type','Reason for visit','DX_count']]
+        admitOutput.columns=['HASAEID','HASAPID', 'Program','MemberID', 'FirstName','LastName','MiddleName','Patient Phone','Address','City','State','ZIPCode','PrevEncounters','PCP Name','PCP TIN','Facility','MRN','DOB','Age','Gender','Race','Ethnicity','FinancialClass','AdmitTime','DischargeTime','AdmitType','CareSetting','PatientType','ReasonForVisit','DXCount']
+
+        html = savecsv(admitOutput,downloadbyTIN,"All")
+        print(html)
+   # HASAPID,FirstName,LastName,MiddleName,State,ZIPCode,MRN,Age,Gender,Race,Ethnicity
+
+
+documentation()      
+main()
