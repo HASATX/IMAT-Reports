@@ -321,7 +321,7 @@ def main():
             #exit(0)
         else:    
 #            queryStr = '()s.encounter_class:IN("%s") OR s.patient_class:IN("%s") OR s.patient_type:IN("%s") AND (d.admit_time:[%s TO %s]) AND s.financial_class: NOT IN("NO PAYMENT")' %(eClass,eClass,sdate,edate)
-            queryStr = '()s.patient_class:IN("%s") OR s.patient_type:IN("%s") AND (d.admit_time:[%s TO %s]) AND s.financial_class: NOT IN("NO PAYMENT")' %(eClass,sdate,edate)
+            queryStr = '()s.patient_class:IN("%s") OR s.patient_type:IN("%s") AND (d.admit_time:[%s TO %s]) AND s.financial_class: NOT IN("NO PAYMENT")' %(eClass,eClass,sdate,edate)
 
             #queryStr = queryStr + ' AND (d.admit_time:[%s TO %s])' %(sdate,edate)
             #print("howdy",queryStr)
