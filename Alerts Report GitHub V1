@@ -2,6 +2,7 @@
 # Added patient phone number to output - June 22, 2017, Andrea Espinosa
 # Changed from number of days looking back to interactive date range - June 26, 2017, Andrea Espinosa
 # V7.1.03
+# Alerts Report updated to include Observation - July 19, 2018 Rharris
 
 # ---- SET up PANDAS options ----
 import datetime as dt
