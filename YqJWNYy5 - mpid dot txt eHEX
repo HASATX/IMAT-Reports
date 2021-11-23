@@ -1,0 +1,351 @@
+import datetime
+import pandas as pd
+import xml.sax.saxutils as SU
+import json
+
+
+
+def save_textfile(filename, filecontents, filemode='w'):
+    file = artifacts.open(filename, filemode)
+    file.write(filecontents)
+    file.close()
+    return artifacts.getURL('/output/%s' % filename)
+
+
+def return_response(response):
+    print("Final Response to ROSETTA: ",response)
+
+
+def check_multiple(store, limit,fields,mpi_query, field, value):
+
+    mpi_query += '()%s:("%s")' % (field,value)
+    data = get_hits(mpi_query, store=store, limit=limit, fields=fields)
+    data = data.drop_duplicates('curmpid')    
+    matches = len(data)
+    if matches == 0:
+        status = "no patient found"
+        stop = False 
+    if matches == 1:
+        status = data['curmpid'][0]
+        stop = True                       
+    if matches >= 2:
+        status = "multiple matches"  
+        stop = False
+ 
+
+#    print(mpi_query)  
+#    print(data.to_html())
+    return(stop,status)
+
+def fhir_out(data):
+
+#    data_fields = 'curmpid, mpid, patient_first_name, patient_last_name, patient_sex, patient_local_id, patient_date_of_birth, patient_zip, patient_phone, patient_city,patient_street_address, patient_state, index_time'
+    mpid = data['mpid'][0]
+    curmpid = data['curmpid'][0]
+    if mpid != "":
+        mpid = mpid
+    else:
+        mpid = curmpid
+    mpid = str(mpid)
+    given = str(data['patient_first_name'][0])
+    family = str(data['patient_last_name'][0])
+    gender = str(data['patient_sex'][0]).lower()
+    birthDate = str(data['patient_date_of_birth'][0])
+    postalCode = str(data['patient_zip'][0])
+    telecom = str(data['patient_phone'][0])
+    city = str(data['patient_city'][0])
+    street = str(data['patient_street_address'][0])
+    state = str(data['patient_state'][0])
+    start = str(data['index_time'][0])
+    
+    
+
+# FHIR Patient Template
+
+    FHIR_Template = """
+{
+  "resourceType": "Patient",
+  "id": "mpid",
+  "text": {
+    "status": "generated"
+  },
+  "identifier": [
+    {
+      "use": "usual",
+      "type": {
+        "coding": [
+          {
+            "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+            "code": "MR"
+          }
+        ]
+      },
+      "system": "urn:oid:2.16.840.1.113883.3.7613",
+      "value": "%s",
+      "period": {
+        "start": "%s"
+      },
+      "assigner": {
+        "display": "HASA"
+      }
+    }
+  ],
+  "active": true,
+  "name": [
+    {
+      "use": "official",
+      "family": "%s",
+      "given": [
+        "%s"
+      ]
+    },
+
+  ],
+  "telecom": [
+    {
+      "system": "phone",
+      "value": "%s"
+     }
+  ],
+  "telecom": [
+    {
+      "system": "email",
+      "value": ""
+     }
+  ],
+  "gender": "%s",
+  "birthDate": "%s",
+  "address": [
+    {
+      "use": "home",
+      "type": "both",
+      "text": "%s, %s, %s,  %s",
+      "line": [
+        "%s"
+      ],
+      "city": "%s",
+      "state": "%s",
+      "postalCode": "%s",
+      "period": {
+        "start": "%s"
+      }
+    }
+  ],
+
+  "managingOrganization": {
+    "reference": "Organization/1",
+    "display": "HASA"
+  }
+}
+""" % (mpid,start,family, given, telecom, gender, birthDate, street, city, state, postalCode, street, city, state, postalCode,start)
+    return(FHIR_Template)    
+    
+
+def main():
+    store = 1100
+    store2 = 7
+    limit = -1
+
+    fields = 'curmpid, mpid, patient_first_name, patient_last_name, patient_sex, patient_local_id, patient_date_of_birth, patient_zip, patient_phone, patient_city, patient_street_address, patient_state, index_time'
+#    matching_fields =  'ssn4', 'fmrn', 'patient_last_name', 'patient_state', 'patient_sex', 'patient_zip', 'patient_street_address',  'patient_date_of_birth', 'patient_first_name', 'patient_city, patient_phone, patient_email'
+
+
+#family
+#given
+#birthdate
+#gender
+#streetAddressLine1
+#streetAddressLine2
+#city
+#state
+#postalCode
+#telecom
+#email
+#patient_local_id
+
+
+    params.add("family", type="str", display_name="Last name")
+    params.add("given", type="str", display_name="First name")
+    params.add("birthDate", type="str", display_name="Date of birth")
+    params.add("gender", type="str", display_name = "Sex")
+    params.add("streetAddressLine1", type="str", display_name="patient_street_address")
+    params.add("streetAddressLine2", type="str", display_name="patient_street_address")
+    params.add("city", type="str", display_name="patient_city")
+    params.add("state", type="str", display_name="state")    
+    params.add("postalCode", type="str", display_name="patient_zip")
+    params.add("telecom", type="str", display_name="patient_phone")
+    params.add("email", type="str", display_name="patient_email")
+    params.add("patient_local_id", type="str", display_name="patient_local_id")    
+    params.end()
+    
+    last_name = params.family
+    first_name = params.given
+    date_of_birth = params.birthDate
+    sex = params.gender
+    street = params.streetAddressLine1
+    street2 = params.streetAddressLine2
+    city = params.city
+    zip = params.postalCode
+    state = params.state
+    phone = params.telecom    
+    email = params.email
+    fmrn = params.patient_local_id
+    
+   
+    mpi_query = ""
+    stop = False
+    status = ""
+    matches = 0
+    data = pd.DataFrame()
+    mpid = ""
+
+# Start with an fmrn query only
+    if fmrn != "":
+        mpi_query = ' ()s.patient_local_id:("%s")' % fmrn
+        data = get_hits(mpi_query, store=store2, limit=limit, fields=fields) 
+        data  = data.drop_duplicates('mpid')
+        matches = len(data)
+        if matches >=1:
+            mpid = data['mpid'][0]
+ 
+
+
+## check for match count
+
+    if matches == 0:
+        status = "no patient found"
+        stop = False
+    if matches == 1:
+        stop = True
+        return_response(mpid)
+
+    if stop == False:    
+        mpi_query = ""
+        identifiers = 0
+        if last_name != "":
+            mpi_query += ' ()s.patient_last_name:IN("%s")' % last_name
+            identifiers +=1
+ 
+        if first_name != "":
+            mpi_query += ' ()s.patient_first_name:IN("%s")' % first_name
+            identifiers +=1
+
+        if date_of_birth != "":
+            mpi_query += ' ()d.patient_date_of_birth:[%s]' % date_of_birth
+            identifiers +=1
+        
+        if sex != "":
+            if sex == "m":
+               sex = "male"
+            if sex == "f":
+               sex = "female"
+            mpi_query += ' ()s.patient_sex:IN("%s")' % sex
+            identifiers +=1
+
+        
+## Try for one match with minimum data
+#        print("basic fields: ",mpi_query)
+        if identifiers != 4:
+        #if 1==2:
+            stop = True
+            return_response("no patient found")
+        else:    
+            data = get_hits(mpi_query, store=store, limit=limit, fields=fields)
+            if len(data) >=2:
+                data = data.drop_duplicates('curmpid')    
+            matches = len(data)
+ #           print("Found matches ",matches)
+
+## check for match count
+            if matches == 0:
+                return_response("no patient found")
+                stop = True
+            if matches == 1:
+                return_response(data['curmpid'][0])
+                stop = True                       
+            if matches >= 2:
+                stop = False
+                status = "multiple matches"
+            
+
+
+## if multiple matches, add more fields
+
+        if stop == False:
+            base_mpi_query = mpi_query
+            if street != "":
+                mpi_query += ' ()s.patient_street_address:("%s")' % street
+            if city != "":
+                mpi_query += ' ()s.patient_city:("%s")' % city
+            if zip != "":
+                mpi_query += ' ()s.patient_zip:("%s")' % zip
+            if phone != "":
+                mpi_query += ' ()s.patient_phone:("%s")' % phone       
+            if email != "":
+                mpi_query += ' ()s.patient_email:("%s")' % email
+                
+            data = get_hits(mpi_query, store=store, limit=limit, fields=fields)
+            data = data.drop_duplicates('curmpid')    
+            matches = len(data)
+#            print(mpi_query)
+#            data = data.sort('patient_date_of_birth', ascending=False)
+#            print(store,data.to_html())
+            
+
+## check for match count
+            if matches == 0:
+                status = "no patient found"
+                stop = False  #limited too far
+            if matches == 1:
+                return_response(data['curmpid'][0])
+                stop = True                       
+            if matches >= 2:
+                return_response("no patient found") # multiple matches found with all fields
+                stop = True
+
+
+## last try - mutiple matches with basics, no matches with all 
+            if stop == False:
+                mpi_query = base_mpi_query
+                if street != "":
+                    check = check_multiple(store, limit,fields,mpi_query, "s.patient_street_address", street)
+                    stop = check[0]
+                    if stop == True:
+                        return_response(check[1])
+  #              if stop == False and city != "":
+  #                  check = check_multiple(store, limit,fields,mpi_query, "s.patient_city", city)
+  #                  stop = check[0]
+  #                  if stop == True:
+  #                      return_response(check[1])
+  #              if stop == False and zip !="":
+  #                  check = check_multiple(store, limit,fields,mpi_query, "s.patient_zip", zip)
+  #                  stop = check[0]
+  #                  if stop == True:
+  #                      return_response(check[1])
+                if stop == False and phone != "":  # Exhausted all 
+                    check = check_multiple(store, limit,fields,mpi_query, "s.patient_phone", phone)
+                    stop = check[0]
+                    if stop == True:
+                        return_response(check[1])
+                if stop == False and email != "":  # Exhausted all 
+                    check = check_multiple(store, limit,fields,mpi_query, "s.patient_email", email)
+                    stop = check[0]
+                    if stop == True:
+                        return_response(check[1])
+                if stop == False:  #exhausted all options
+                    return_response("no patient found")
+
+    if stop == True and matches == 1:
+#        print(data.to_html())
+        data = data.fillna(value="")
+#        output = data.to_json(orient='records')
+        output2 = fhir_out(data)
+    else:
+        output2 = "{}"
+        #print(output)
+    print('<textarea>',output2,'</textarea>') 
+    print("""<a href="{lnk}"><span style="padding: 10px" class="glyphicon glyphicon-download_alt"></span>mpid</a>""".format(lnk=save_textfile('mpid.json',output2)))
+
+
+
+main()
